@@ -1,0 +1,12 @@
+# ═══════════════════════════════════════════════════════════
+# AURUM AI — STEP 1: MARKET STRUCTURE MAPPING
+# requirements.txt   ·   install:  pip install -r requirements.txt
+# ═══════════════════════════════════════════════════════════
+# Step 1 is pure structural analysis — no AI API, no trading
+# libraries. sqlite3 is stdlib (not listed).
+# ═══════════════════════════════════════════════════════════
+
+MetaTrader5>=5.0.45
+pandas>=2.1.0
+numpy>=1.26.0
+pytz>=2024.1

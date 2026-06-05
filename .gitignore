@@ -1,0 +1,51 @@
+# ═══════════════════════════════════════════════════════════
+# AURUM AI — .gitignore
+# Credentials, runtime artifacts, IDE noise.
+# ═══════════════════════════════════════════════════════════
+
+# CREDENTIALS — NEVER COMMIT
+config_local.py
+.env
+.env.*
+*.secret
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.python-version
+
+# Runtime artifacts
+logs/
+*.log
+*.log.*
+database/
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated reports / overlay caches
+structure_report.txt
+aurum_overlay.csv
+aurum_structure.csv
+
+# Editors / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# OS / Windows
+Desktop.ini
+
+# MetaEditor compiled output
+mt5/*.ex5
+*.ex5
