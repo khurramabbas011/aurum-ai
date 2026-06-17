@@ -1,0 +1,1 @@
+# AURUM AI — core package

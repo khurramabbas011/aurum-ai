@@ -26,9 +26,11 @@ logs/
 *.log
 *.log.*
 database/
+data_store/
 *.db
 *.sqlite
 *.sqlite3
+playbook.json
 
 # Generated reports / overlay caches
 structure_report.txt

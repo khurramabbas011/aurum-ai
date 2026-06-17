@@ -1,11 +1,14 @@
 # ═══════════════════════════════════════════════════════════
-# AURUM AI — STEP 1: MARKET STRUCTURE MAPPING
-# main.py — entry point.  Run with:  python main.py
+# AURUM AI — FULL SYSTEM ENTRY POINT
+#   python main.py backtest   — run the full pipeline on synthetic
+#                               data with self-learning (no MT5)
+#   python main.py analyze    — live MT5 structure + bias + signal
+#   python main.py chart [TF] — write an HTML structure chart
+#   python main.py live       — 24/5 loop (PAPER unless live enabled)
+#   python main.py playbook   — print what the agent has learned
 #
-# Connects to MT5, maps XAUUSD structure top-down on every
-# timeframe (D1 → H4 → H1 → M30 → M15 → M5 → M1), draws it on
-# the chart via the AURUM_HUD indicator, and reports.
-# NO trading. Identification, drawing, and reporting only.
+# Live order placement is OFF unless ENABLE_LIVE_TRADING=True
+# (config_local.py) on a demo account. Risk rails always enforced.
 # ═══════════════════════════════════════════════════════════
 
 import sys
@@ -13,135 +16,203 @@ import time
 import traceback
 
 import config
-from modules.utils import get_logger, gmt_stamp
-from modules.mt5_connector import MT5Connector, MT5ConnectionError
-from modules.structure_engine import StructureEngine
-from modules.chart_drawer import ChartDrawer
-from modules import reporter
+from core.utils import get_logger, gmt_now
+from analysis.structure import StructureEngine
+from analysis.multi_tf import MultiTF
+from strategy.signals import SignalEngine
+from trading.risk import RiskEngine
+from trading.manager import TradeManager
+from learning.memory import Memory
+from learning.playbook import Playbook
+from reporting import reporter, chart
 
 log = get_logger("main")
 
 BANNER = r"""
 ╔══════════════════════════════════════════════════════════╗
-║                      A U R U M   A I                     ║
-║              STEP 1 — MARKET STRUCTURE MAPPING            ║
-║                  XAUUSD · M1 → D1 · MT5                  ║
-╠══════════════════════════════════════════════════════════╣
-║  Identify the structure. Draw it. Report it.             ║
-║  No trading. No entries. Observation only.               ║
+║                     A U R U M   A I                      ║
+║      Adaptive XAUUSD system · analysis → execution        ║
+║        structure · signals · risk · self-learning         ║
 ╚══════════════════════════════════════════════════════════╝
 """
 
 
-class AurumStructureAgent:
-    """Step 1 orchestrator — multi-timeframe structure mapper."""
+# ───────────────────────── helpers ─────────────────────────
+def _synthetic_frames(seed=7, days=90):
+    from data.replay_feed import SyntheticMarket
+    return SyntheticMarket(seed=seed, minutes=60 * 24 * days).build()
 
-    def __init__(self):
-        self.mt5 = MT5Connector()
-        self.engine = StructureEngine()
-        self.drawer = ChartDrawer()
-        self.running = True
 
-    # ───────────────────────────────────────────────────────
-    def startup(self):
-        print(BANNER)
-        problems = config.validate()
-        if problems:
-            log.error("CONFIG PROBLEMS — fix config.py first:")
-            for p in problems:
-                log.error("  - %s", p)
-            sys.exit(1)
-        self.mt5.connect()
-        log.info("AURUM AI Step 1 ready — mapping order: %s",
-                 " -> ".join(config.TIMEFRAMES))
+def _live_feed():
+    from data.mt5_feed import MT5Feed
+    feed = MT5Feed()
+    feed.connect()
+    return feed
 
-    # ───────────────────────────────────────────────────────
-    # ONE FULL TOP-DOWN MAPPING PASS
-    # ───────────────────────────────────────────────────────
-    def run_pass(self):
-        """Map every timeframe, draw, and produce all reports."""
-        results = []
-        reports = []
-        higher_tf = None
-        higher_state = None
 
-        for tf in config.TIMEFRAMES:
-            try:
-                df = self.mt5.get_ohlcv(tf, config.BAR_COUNT[tf])
-                analysis = self.engine.analyze(tf, df)
-                counts = self.drawer.draw_structure(analysis)
-                rpt = reporter.timeframe_report(analysis, counts,
-                                                higher_tf, higher_state)
-                print(rpt)
-                reports.append(rpt)
-                results.append(analysis)
-                # this timeframe becomes the "higher TF" for the next
-                higher_tf = tf
-                higher_state = analysis.get("state")
-            except Exception as e:
-                log.error("%s analysis failed: %s\n%s", tf, e,
-                          traceback.format_exc())
+# ───────────────────────── commands ─────────────────────────
+def cmd_backtest(args):
+    seed = int(args[0]) if args else 7
+    print(BANNER)
+    log.info("Building synthetic XAUUSD market (seed=%d) ...", seed)
+    frames = _synthetic_frames(seed=seed)
+    mem = Memory()
+    pb = Playbook()
+    from backtest.engine import Backtester
+    bt = Backtester(frames, base_tf="M5", playbook=pb, memory=mem, learn=True)
+    stats = bt.run()
+    print(reporter.backtest_report(stats, pb))
+    mem.close()
 
-        # write all structure objects to the MT5 bridge file (once)
-        self.drawer.commit()
 
-        # master multi-timeframe summary
-        master = reporter.master_summary(results)
-        print(master)
-        reports.append(master)
+def cmd_playbook(_args):
+    print(BANNER)
+    pb = Playbook()
+    print(pb.summary())
 
-        # persist the full report set
+
+def cmd_analyze(_args):
+    print(BANNER)
+    feed = _live_feed()
+    struct, mtf = StructureEngine(), MultiTF()
+    maps = {}
+    for tf in config.TIMEFRAMES:
+        df = feed.get_ohlcv(tf)
+        if len(df) >= 30:
+            maps[tf] = struct.analyze(tf, df)
+    bias = mtf.bias(maps)
+    for tf in config.TIMEFRAMES:
+        if tf in maps:
+            print(reporter.structure_report(maps[tf],
+                                             bias if tf in config.HTF_BIAS_TFS else None))
+    print(reporter.master_report(maps, bias))
+
+    sig_eng = SignalEngine(Playbook())
+    for tf in config.SIGNAL_TFS:
+        if tf in maps:
+            s = sig_eng.generate(tf, maps[tf], bias)
+            if s:
+                print(f"SIGNAL {tf}: {s.side.value} {s.setup.value} "
+                      f"entry {s.entry} sl {s.sl} tp1 {s.tp1} "
+                      f"(R:R {s.rr}, edge {s.edge_score:.2f})")
+    feed.disconnect()
+
+
+def cmd_chart(args):
+    tf = args[0] if args else "M15"
+    print(BANNER)
+    struct, mtf = StructureEngine(), MultiTF()
+    if config.needs_mt5():
+        feed = _live_feed()
+        frames = {t: feed.get_ohlcv(t) for t in config.TIMEFRAMES}
+        feed.disconnect()
+    else:
+        log.info("No MT5 creds — charting synthetic data.")
+        frames = _synthetic_frames()
+    maps = {t: struct.analyze(t, frames[t]) for t in config.TIMEFRAMES
+            if len(frames.get(t, [])) >= 30}
+    bias = mtf.bias(maps)
+    sig = SignalEngine(Playbook()).generate(tf, maps[tf], bias) if tf in maps else None
+    path = chart.render(frames[tf], maps[tf], sig, bias)
+    print(f"Chart written: {path}")
+    print(f"Open it in a browser: file:///{path.replace(chr(92), '/')}")
+
+
+def cmd_live(_args):
+    print(BANNER)
+    problems = config.validate()
+    if problems:
+        for p in problems:
+            log.error("CONFIG: %s", p)
+        sys.exit(1)
+    feed = _live_feed()
+    struct, mtf = StructureEngine(), MultiTF()
+    pb = Playbook()
+    mem = Memory()
+    sig_eng = SignalEngine(pb)
+    risk = RiskEngine()
+
+    # choose broker
+    if config.ENABLE_LIVE_TRADING:
+        from trading.execution import MT5Broker
+        broker = MT5Broker(feed)
+        log.warning("LIVE TRADING ENABLED — real orders on demo=%s", feed.is_demo())
+    else:
+        from trading.execution import PaperBroker
+        acct = feed.account_info()
+        broker = PaperBroker(acct.get("balance", config.PAPER_START_BALANCE))
+        log.info("PAPER mode — no real orders (set ENABLE_LIVE_TRADING to trade).")
+
+    manager = TradeManager(broker)
+    start_balance = broker.account().get("balance", config.PAPER_START_BALANCE)
+    log.info("AURUM AI live loop — scan every %ds. Ctrl+C to stop.",
+             config.SCAN_SECONDS)
+
+    while True:
         try:
-            with open(config.REPORT_FILE, "w", encoding="utf-8") as fh:
-                fh.write(f"AURUM AI — Structure Mapping — {gmt_stamp()} GMT\n")
-                fh.write("\n".join(reports))
-            log.info("Report written -> %s", config.REPORT_FILE)
+            maps = {}
+            for tf in config.TIMEFRAMES:
+                df = feed.get_ohlcv(tf)
+                if len(df) >= 30:
+                    maps[tf] = struct.analyze(tf, df)
+            bias = mtf.bias(maps)
+
+            # manage existing trades on the latest base bar
+            base = feed.get_ohlcv(config.SIGNAL_TFS[0])
+            if not base.empty:
+                bar = base.iloc[-1]
+                swl = float(base["low"].tail(10).min())
+                swh = float(base["high"].tail(10).max())
+                for pos in list(broker.open_positions()):
+                    closed = manager.on_bar(pos.ticket, bar["high"], bar["low"],
+                                            bar["close"], swl, swh)
+                    if closed:
+                        mem.log_trade(closed)
+                        risk.record_result(closed.result == "WIN")
+                        if len(mem.closed_trades()) % config.LEARN_AFTER_TRADES == 0:
+                            pb.fit(mem.closed_trades())
+
+            # hunt a new signal when flat
+            if not broker.open_positions():
+                for tf in config.SIGNAL_TFS:
+                    if tf not in maps:
+                        continue
+                    s = sig_eng.generate(tf, maps[tf], bias)
+                    if not s:
+                        continue
+                    acct = broker.account()
+                    plan = risk.approve(s, acct["balance"], start_balance,
+                                        len(broker.open_positions()), gmt_now())
+                    mem.log_signal(s, plan.approved)
+                    if plan.approved:
+                        pos = broker.market_order(s.side, plan.lots, s.sl,
+                                                  s.tp2, maps[tf].current_price,
+                                                  s.setup.value)
+                        manager.register(pos, s)
+                        break
+        except KeyboardInterrupt:
+            break
         except Exception as e:
-            log.error("Report file write failed: %s", e)
+            log.error("loop error: %s\n%s", e, traceback.format_exc())
+        time.sleep(config.SCAN_SECONDS)
 
-        return results
+    mem.close()
+    feed.disconnect()
+    log.info("AURUM AI live loop stopped.")
 
-    # ───────────────────────────────────────────────────────
-    def run(self):
-        self.startup()
-        while self.running:
-            try:
-                if not self.mt5.is_connected():
-                    raise MT5ConnectionError("MT5 link lost.")
-                log.info("─── Structure mapping pass starting ───")
-                self.run_pass()
-                log.info("─── Pass complete ───")
-            except MT5ConnectionError as e:
-                log.error("MT5 error: %s — retrying in 30s", e)
-                time.sleep(30)
-                try:
-                    self.mt5.connect()
-                except Exception as ce:
-                    log.error("Reconnect failed: %s", ce)
-                continue
-            except KeyboardInterrupt:
-                log.info("KeyboardInterrupt — shutting down.")
-                break
-            except Exception as e:
-                log.error("Unhandled error: %s\n%s", e, traceback.format_exc())
 
-            if not config.RUN_CONTINUOUS:
-                log.info("Single-pass mode — exiting.")
-                break
-            log.info("Next pass in %ds. Ctrl+C to stop.",
-                     config.REFRESH_SECONDS)
-            time.sleep(config.REFRESH_SECONDS)
-        self.shutdown()
-
-    def shutdown(self):
-        self.mt5.disconnect()
-        log.info("AURUM AI Step 1 offline.")
+COMMANDS = {"backtest": cmd_backtest, "analyze": cmd_analyze,
+            "chart": cmd_chart, "live": cmd_live, "playbook": cmd_playbook}
 
 
 if __name__ == "__main__":
-    agent = AurumStructureAgent()
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "backtest"
+    fn = COMMANDS.get(cmd)
+    if not fn:
+        print(f"Unknown command '{cmd}'. Use: {', '.join(COMMANDS)}")
+        sys.exit(1)
     try:
-        agent.run()
+        fn(sys.argv[2:])
     except Exception as exc:
         log.critical("FATAL: %s\n%s", exc, traceback.format_exc())
         sys.exit(1)
