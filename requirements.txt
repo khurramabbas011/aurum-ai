@@ -1,12 +1,13 @@
 # ═══════════════════════════════════════════════════════════
-# AURUM AI — STEP 1: MARKET STRUCTURE MAPPING
+# AURUM AI — Adaptive XAUUSD trading system
 # requirements.txt   ·   install:  pip install -r requirements.txt
 # ═══════════════════════════════════════════════════════════
-# Step 1 is pure structural analysis — no AI API, no trading
-# libraries. sqlite3 is stdlib (not listed).
+# sqlite3 is stdlib (not listed). pytest is dev-only (optional).
 # ═══════════════════════════════════════════════════════════
 
 MetaTrader5>=5.0.45
 pandas>=2.1.0
 numpy>=1.26.0
 pytz>=2024.1
+requests>=2.31.0
+streamlit>=1.30.0

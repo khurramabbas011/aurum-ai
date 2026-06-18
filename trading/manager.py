@@ -30,6 +30,16 @@ class TradeManager:
             "realised": 0.0, "tp1_done": False, "lots0": pos.lots,
         }
 
+    def signatures(self) -> set:
+        """(timeframe, side, setup) of every tracked open trade — used to
+        avoid stacking duplicates of the SAME setup while still allowing
+        different setups/timeframes to run concurrently."""
+        out = set()
+        for meta in self._meta.values():
+            side = meta["side"].value if hasattr(meta["side"], "value") else meta["side"]
+            out.add((meta["timeframe"], side, meta["setup"]))
+        return out
+
     def on_bar(self, ticket: int, high: float, low: float, close: float,
                new_swing_low=None, new_swing_high=None) -> ClosedTrade | None:
         """Advance one position against a new bar. Returns ClosedTrade

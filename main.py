@@ -50,13 +50,67 @@ def _live_feed():
     return feed
 
 
+def _write_snapshot(broker, feed, maps, bias, mode, last_signal, mem, pb,
+                    start_balance, thoughts=None):
+    """Persist live state to snapshot.json so the Streamlit dashboard
+    (separate process) can render without its own MT5 connection."""
+    import json
+    try:
+        price = feed.price()
+        acct = broker.account()
+        daily = mem.closed_trades()
+        wins = sum(1 for t in daily if t["result"] == "WIN")
+        from core.utils import silver_bullet_window
+        snap = {
+            "updated": gmt_now().isoformat(),
+            "mode": mode, "symbol": config.SYMBOL,
+            "sb_window": silver_bullet_window(),
+            "bid": price.get("bid"), "ask": price.get("ask"),
+            "spread_pips": price.get("spread_pips"),
+            "account": acct,
+            "start_balance": start_balance,
+            "bias": {"direction": bias.direction.value, "score": bias.score,
+                     "confidence": bias.confidence,
+                     "aligned": bias.aligned_tfs,
+                     "conflicting": bias.conflicting_tfs,
+                     "reasoning": bias.reasoning},
+            "timeframes": {tf: {
+                "state": m.state.value,
+                "event": f"{m.event.type.value} {m.event.direction.value}"
+                         if m.event.direction else m.event.type.value,
+                "sweep": bool(m.sweep.detected),
+                "unicorn": bool(m.unicorn),
+                "pd_zone": m.pd_zone,
+                "price": m.current_price} for tf, m in maps.items()},
+            "positions": [{"ticket": p.ticket, "side": p.side.value,
+                           "entry": p.entry, "lots": p.lots, "sl": p.sl,
+                           "tp": p.tp, "profit": round(p.profit, 2)}
+                          for p in broker.open_positions()],
+            "trades_total": len(daily),
+            "wins": wins,
+            "win_rate": round(wins / len(daily) * 100, 1) if daily else 0.0,
+            "net_r": round(sum(t["pnl_r"] or 0 for t in daily), 2),
+            "last_signal": last_signal,
+            "playbook": pb.meta,
+            "thoughts": thoughts or [],
+        }
+        import os as _os
+        _os.makedirs(_os.path.dirname(config.SNAPSHOT_FILE), exist_ok=True)
+        tmp = config.SNAPSHOT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(snap, fh, default=str)
+        _os.replace(tmp, config.SNAPSHOT_FILE)
+    except Exception as e:
+        log.debug("snapshot write skipped: %s", e)
+
+
 # ───────────────────────── commands ─────────────────────────
 def cmd_backtest(args):
     seed = int(args[0]) if args else 7
     print(BANNER)
     log.info("Building synthetic XAUUSD market (seed=%d) ...", seed)
     frames = _synthetic_frames(seed=seed)
-    mem = Memory()
+    mem = Memory(config.BACKTEST_DB_PATH)   # keep backtest stats out of live.db
     pb = Playbook()
     from backtest.engine import Backtester
     bt = Backtester(frames, base_tf="M5", playbook=pb, memory=mem, learn=True)
@@ -144,9 +198,21 @@ def cmd_live(_args):
         log.info("PAPER mode — no real orders (set ENABLE_LIVE_TRADING to trade).")
 
     manager = TradeManager(broker)
+    import collections
+    from core.notify import Discord
+    discord = Discord()
+    mode = "LIVE (demo orders)" if config.ENABLE_LIVE_TRADING else "PAPER"
     start_balance = broker.account().get("balance", config.PAPER_START_BALANCE)
-    log.info("AURUM AI live loop — scan every %ds. Ctrl+C to stop.",
-             config.SCAN_SECONDS)
+    discord.startup(mode, broker.account(), config.SYMBOL)
+    last_signal = None
+    thoughts = collections.deque(maxlen=40)   # live-thinking feed for dashboard
+
+    def think(msg):
+        thoughts.append(f"{gmt_now().strftime('%H:%M:%S')} · {msg}")
+
+    log.info("AURUM AI live loop [%s] — scan every %ds. Ctrl+C to stop.",
+             mode, config.SCAN_SECONDS)
+    think(f"engine online [{mode}] — watching {config.SYMBOL}")
 
     while True:
         try:
@@ -156,6 +222,10 @@ def cmd_live(_args):
                 if len(df) >= 30:
                     maps[tf] = struct.analyze(tf, df)
             bias = mtf.bias(maps)
+            price = feed.price()
+            n_open = len(broker.open_positions())
+            think(f"bias {bias.direction.value} ({bias.score:+.2f}) · "
+                  f"px {price.get('bid')} · pos {n_open}/{config.MAX_OPEN_POSITIONS}")
 
             # manage existing trades on the latest base bar
             base = feed.get_ohlcv(config.SIGNAL_TFS[0])
@@ -169,27 +239,70 @@ def cmd_live(_args):
                     if closed:
                         mem.log_trade(closed)
                         risk.record_result(closed.result == "WIN")
+                        think(f"🏁 CLOSE #{closed.ticket} {closed.setup} "
+                              f"{closed.result} {closed.pnl_r:+}R")
+                        discord.trade_close(closed)
                         if len(mem.closed_trades()) % config.LEARN_AFTER_TRADES == 0:
                             pb.fit(mem.closed_trades())
+                            think("↻ self-learning: playbook refit")
 
-            # hunt a new signal when flat
-            if not broker.open_positions():
-                for tf in config.SIGNAL_TFS:
-                    if tf not in maps:
-                        continue
-                    s = sig_eng.generate(tf, maps[tf], bias)
-                    if not s:
-                        continue
-                    acct = broker.account()
-                    plan = risk.approve(s, acct["balance"], start_balance,
-                                        len(broker.open_positions()), gmt_now())
-                    mem.log_signal(s, plan.approved)
-                    if plan.approved:
-                        pos = broker.market_order(s.side, plan.lots, s.sl,
-                                                  s.tp2, maps[tf].current_price,
-                                                  s.setup.value)
-                        manager.register(pos, s)
-                        break
+            # hunt setups — allow several concurrent (different setup/tf/side);
+            # never stack duplicates of the same setup signature
+            active_sigs = manager.signatures()
+            for tf in config.SIGNAL_TFS:
+                if len(broker.open_positions()) >= config.MAX_OPEN_POSITIONS:
+                    think("at max positions — not opening more")
+                    break
+                if tf not in maps:
+                    continue
+                s = sig_eng.generate(tf, maps[tf], bias)
+                if sig_eng.last_reason != "no setup":
+                    think(f"{tf}: {sig_eng.last_reason}")   # the bot's reasoning
+                if not s:
+                    continue
+                key = (tf, s.side.value, s.setup.value)
+                if key in active_sigs:          # same setup already running
+                    think(f"{tf}: {s.setup.value} already open — skip dup")
+                    continue
+                acct = broker.account()
+                plan = risk.approve(s, acct["balance"], start_balance,
+                                    len(broker.open_positions()), gmt_now())
+                mem.log_signal(s, plan.approved)
+                last_signal = {"tf": tf, "side": s.side.value,
+                               "setup": s.setup.value, "entry": s.entry,
+                               "sl": s.sl, "tp1": s.tp1, "rr": s.rr,
+                               "edge": s.edge_score,
+                               "approved": plan.approved,
+                               "reason": plan.reason,
+                               "time": gmt_now().isoformat()}
+                if plan.approved:
+                    pos = broker.market_order(s.side, plan.lots, s.sl,
+                                              s.tp2, maps[tf].current_price,
+                                              s.setup.value)
+                    # re-anchor SL/TP to the ACTUAL fill so every trade is
+                    # exactly FIXED_SL_PIPS / FIXED_TP_PIPS (kills slippage drift)
+                    if config.USE_FIXED_SL_TP and pos:
+                        risk = config.FIXED_SL_PIPS * config.PIP_SIZE
+                        rew = config.FIXED_TP_PIPS * config.PIP_SIZE
+                        if s.side.value == "BUY":
+                            nsl, ntp = round(pos.entry - risk, 2), round(pos.entry + rew, 2)
+                        else:
+                            nsl, ntp = round(pos.entry + risk, 2), round(pos.entry - rew, 2)
+                        broker.modify(pos.ticket, sl=nsl, tp=ntp)
+                        pos.sl, pos.tp = nsl, ntp
+                        s.sl, s.tp1, s.tp2 = nsl, ntp, ntp
+                    manager.register(pos, s)
+                    active_sigs.add(key)
+                    think(f"⚡ OPEN {s.side.value} {s.setup.value} {tf} "
+                          f"@ {pos.entry} SL {pos.sl} TP {pos.tp} ({plan.lots} lots)")
+                    discord.trade_open(s.side.value, s.setup.value, tf,
+                                       s.entry, s.sl, s.tp1, s.tp2, s.rr,
+                                       plan.lots, s.edge_score)
+                else:
+                    think(f"✖ {tf} {s.setup.value} blocked: {plan.reason}")
+
+            _write_snapshot(broker, feed, maps, bias, mode, last_signal,
+                            mem, pb, start_balance, list(thoughts))
         except KeyboardInterrupt:
             break
         except Exception as e:
@@ -201,8 +314,21 @@ def cmd_live(_args):
     log.info("AURUM AI live loop stopped.")
 
 
+def cmd_dashboard(_args):
+    """Launch the Streamlit dashboard (separate process)."""
+    import subprocess
+    app = os.path.join(config.BASE_DIR, "dashboard", "app.py")
+    log.info("Launching dashboard -> http://localhost:8501")
+    subprocess.run([sys.executable, "-m", "streamlit", "run", app,
+                    "--server.headless=true", "--server.port=8501"],
+                   cwd=config.BASE_DIR)
+
+
+import os  # noqa: E402  (used by cmd_dashboard)
+
 COMMANDS = {"backtest": cmd_backtest, "analyze": cmd_analyze,
-            "chart": cmd_chart, "live": cmd_live, "playbook": cmd_playbook}
+            "chart": cmd_chart, "live": cmd_live, "playbook": cmd_playbook,
+            "dashboard": cmd_dashboard}
 
 
 if __name__ == "__main__":

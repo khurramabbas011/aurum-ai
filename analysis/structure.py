@@ -17,7 +17,7 @@ import pandas as pd
 
 import config
 from core.models import (FVG, State, EventType, StructureEvent, StructureMap,
-                         Sweep, Swing)
+                         Sweep, Swing, Zone)
 from core.utils import get_logger, to_pips
 
 log = get_logger("structure")
@@ -177,6 +177,60 @@ class StructureEngine:
                                  (after["high"] >= g.bottom)).any())
         return [g for g in out if not g.filled][-limit:]
 
+    # ---------- ICT unicorn (breaker block ∩ FVG) ----------
+    def breaker_unicorn(self, df, swings, event, fvgs):
+        """The ICT Unicorn: a *breaker block* that overlaps a *fair
+        value gap*, in the direction of the most recent structure
+        shift. Returns (breaker_zone, unicorn_zone | None).
+
+        Breaker (bullish): the last DOWN candle around the swing low
+        that price rallied from to break structure up — once structure
+        breaks, that supply becomes support. Unicorn = where that
+        breaker overlaps an unfilled bullish FVG (and mirror for shorts).
+        """
+        none = (None, None)
+        if event.type == EventType.NONE or event.direction is None:
+            return none
+        highs = [s for s in swings if s.kind == "HIGH"]
+        lows = [s for s in swings if s.kind == "LOW"]
+        n = len(df)
+
+        if event.direction == State.BULLISH:
+            if not lows:
+                return none
+            piv = lows[-1]
+            seg = df.iloc[max(0, piv.index - 3):min(n, piv.index + 2)]
+            bear = seg[seg["close"] < seg["open"]]
+            c = bear.iloc[-1] if not bear.empty else df.iloc[piv.index]
+            breaker = Zone(State.BULLISH, round(float(c["high"]), 2),
+                           round(float(c["low"]), 2), "breaker", c["time"])
+            for g in fvgs:
+                if g.direction == State.BULLISH and not g.filled:
+                    lo = max(breaker.bottom, g.bottom)
+                    hi = min(breaker.top, g.top)
+                    if hi > lo:
+                        return breaker, Zone(State.BULLISH, round(hi, 2),
+                                             round(lo, 2), "unicorn", g.time)
+            return breaker, None
+
+        # bearish
+        if not highs:
+            return none
+        piv = highs[-1]
+        seg = df.iloc[max(0, piv.index - 3):min(n, piv.index + 2)]
+        bull = seg[seg["close"] > seg["open"]]
+        c = bull.iloc[-1] if not bull.empty else df.iloc[piv.index]
+        breaker = Zone(State.BEARISH, round(float(c["high"]), 2),
+                       round(float(c["low"]), 2), "breaker", c["time"])
+        for g in fvgs:
+            if g.direction == State.BEARISH and not g.filled:
+                lo = max(breaker.bottom, g.bottom)
+                hi = min(breaker.top, g.top)
+                if hi > lo:
+                    return breaker, Zone(State.BEARISH, round(hi, 2),
+                                         round(lo, 2), "unicorn", g.time)
+        return breaker, None
+
     # ---------- premium / discount ----------
     @staticmethod
     def pd_zone(df, swings):
@@ -218,6 +272,7 @@ class StructureEngine:
         m.event = self.event(df, sw, st)
         m.sweep = self.sweep(df, sw)
         m.fvgs = self.fvgs(df)
+        m.breaker, m.unicorn = self.breaker_unicorn(df, sw, m.event, m.fvgs)
         m.pd_zone, m.range_high, m.range_low, m.equilibrium = zone, rh, rl, eq
         m.current_price = round(float(df["close"].iloc[-1]), 2)
         return m

@@ -34,6 +34,9 @@ class EventType(str, Enum):
 
 
 class SetupType(str, Enum):
+    UNICORN = "UNICORN"              # ICT unicorn: breaker + FVG overlap on MSS
+    SILVER_BULLET = "SILVER_BULLET"  # ICT time-window FVG entry toward liquidity
+    VENOM = "VENOM"                  # aggressive strike + MSS + displacement FVG
     SWEEP_CHOCH = "SWEEP_CHOCH"      # liquidity sweep + CHoCH reversal
     BOS_CONTINUATION = "BOS_CONT"    # trend continuation on BOS retest
 
@@ -81,6 +84,16 @@ class FVG:
 
 
 @dataclass(slots=True)
+class Zone:
+    """A price band (breaker block, FVG, or their unicorn overlap)."""
+    direction: State
+    top: float
+    bottom: float
+    kind: str = ""                    # breaker | fvg | unicorn
+    time: Optional[datetime] = None
+
+
+@dataclass(slots=True)
 class StructureMap:
     """Everything the analysis engine knows about ONE timeframe."""
     timeframe: str
@@ -97,6 +110,8 @@ class StructureMap:
     event: StructureEvent = field(default_factory=StructureEvent)
     sweep: Sweep = field(default_factory=Sweep)
     fvgs: list[FVG] = field(default_factory=list)
+    breaker: Optional["Zone"] = None       # most recent breaker block
+    unicorn: Optional["Zone"] = None       # breaker ∩ FVG overlap (ICT unicorn)
     pd_zone: str = "—"                # PREMIUM | DISCOUNT | EQUILIBRIUM
     range_high: Optional[float] = None
     range_low: Optional[float] = None

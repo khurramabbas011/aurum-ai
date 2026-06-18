@@ -56,6 +56,8 @@ class PaperBroker:
         lots = round(p.lots * fraction, 2)
         sign = 1 if p.side == Side.BUY else -1
         pnl = sign * (price - p.entry) * lots * 100.0   # $100 per $1 per lot
+        # model trading cost (spread/commission) so paper/backtest is honest
+        pnl -= config.SPREAD_COST_PIPS * config.PIP_SIZE * lots * 100.0
         self.balance += pnl
         self.equity = self.balance
         if fraction >= 1.0 or lots >= p.lots:
@@ -110,7 +112,10 @@ class MT5Broker:
         if r is None or r.retcode != mt5.TRADE_RETCODE_DONE:
             raise RuntimeError(f"order failed: {getattr(r,'retcode',None)} "
                                f"{getattr(r,'comment','')}")
-        return Position(r.order, side, req["price"], lots, sl, tp, gmt_now(), setup)
+        # use the ACTUAL deal fill price (not the requested price) so
+        # post-fill SL/TP anchoring is exact
+        fill = getattr(r, "price", 0) or req["price"]
+        return Position(r.order, side, fill, lots, sl, tp, gmt_now(), setup)
 
     def modify(self, ticket, sl=None, tp=None):
         for p in mt5.positions_get(symbol=config.SYMBOL) or []:

@@ -51,10 +51,10 @@ class ReplayFeed:
             return pd.DataFrame(columns=["time", "open", "high", "low",
                                          "close", "tick_volume", "spread"])
         cutoff = self._cutoff_time()
-        visible = df[df["time"] <= cutoff]
-        if bars:
-            visible = visible.tail(bars)
-        return visible.reset_index(drop=True)
+        # O(log n) index slice instead of an O(n) boolean scan every call
+        idx = int(df["time"].searchsorted(cutoff, side="right"))
+        start = max(0, idx - bars) if bars else 0
+        return df.iloc[start:idx].reset_index(drop=True)
 
     def price(self) -> dict:
         df = self.get_ohlcv(self.base_tf)

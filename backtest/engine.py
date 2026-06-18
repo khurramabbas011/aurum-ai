@@ -57,7 +57,10 @@ class Backtester:
             if tf in config.HTF_BIAS_TFS and not refresh_htf and tf in self._htf_cache:
                 maps[tf] = self._htf_cache[tf]
                 continue
-            df = self.feed.get_ohlcv(tf, config.BAR_COUNT.get(tf))
+            # 220 bars is plenty to read recent structure and is ~3x
+            # faster per pass than the full live BAR_COUNT window
+            bars = min(config.BAR_COUNT.get(tf, 300), 220)
+            df = self.feed.get_ohlcv(tf, bars)
             if len(df) >= 30:
                 m = self.struct.analyze(tf, df)
                 maps[tf] = m
@@ -65,7 +68,7 @@ class Backtester:
                     self._htf_cache[tf] = m
         return maps
 
-    def run(self, warmup: int = 400, signal_every: int = 3) -> dict:
+    def run(self, warmup: int = 250, signal_every: int = 6) -> dict:
         n = len(self.feed)
         log.info("Backtest: %d base bars (%s), warmup %d", n, self.base_tf, warmup)
         self.feed.seek(warmup)
@@ -88,10 +91,10 @@ class Backtester:
                 if closed:
                     self._record(closed)
 
-            # 2) look for a new signal (throttled, only when flat)
-            if i % signal_every == 0 and not self.broker.open_positions():
-                # pass SIMULATED bar time so daily caps key off backtest
-                # time, not wall clock
+            # 2) look for setups (throttled) — allow several concurrent
+            if i % signal_every == 0 and \
+                    len(self.broker.open_positions()) < config.MAX_OPEN_POSITIONS:
+                # pass SIMULATED bar time so daily caps key off backtest time
                 self._maybe_enter(bar["time"])
 
             self.equity_curve.append(round(self.broker.equity, 2))
@@ -106,12 +109,18 @@ class Backtester:
         if self.base_tf not in maps:
             return
         bias = self.mtf.bias(maps)
+        active = self.manager.signatures()
         for tf in config.SIGNAL_TFS:
+            if len(self.broker.open_positions()) >= config.MAX_OPEN_POSITIONS:
+                break
             m = maps.get(tf)
             if not m:
                 continue
             sig = self.signals.generate(tf, m, bias, now=now)
             if not sig:
+                continue
+            key = (tf, sig.side.value, sig.setup.value)
+            if key in active:                 # don't stack the same setup
                 continue
             plan = self.risk.approve(sig, self.broker.balance,
                                      self.start_balance,
@@ -125,7 +134,7 @@ class Backtester:
             pos = self.broker.market_order(sig.side, plan.lots, sig.sl,
                                            sig.tp2, price, sig.setup.value)
             self.manager.register(pos, sig)
-            return
+            active.add(key)
 
     def _record(self, closed):
         self.trades.append(closed)
@@ -150,6 +159,19 @@ class Backtester:
         for e in self.equity_curve:
             peak = max(peak, e)
             max_dd = max(max_dd, peak - e)
+
+        # per-setup breakdown (win rate by ICT model)
+        by_setup = {}
+        for x in t:
+            d = by_setup.setdefault(x.setup, {"n": 0, "w": 0, "r": 0.0})
+            d["n"] += 1
+            d["w"] += 1 if x.result == "WIN" else 0
+            d["r"] += x.pnl_r
+        for k, d in by_setup.items():
+            d["win_rate"] = round(d["w"] / d["n"] * 100, 1) if d["n"] else 0.0
+            d["net_r"] = round(d["r"], 2)
+            d["avg_r"] = round(d["r"] / d["n"], 3) if d["n"] else 0.0
+
         return {
             "trades": len(t),
             "wins": len(wins), "losses": len(losses),
@@ -161,4 +183,5 @@ class Backtester:
             "max_drawdown_usd": round(max_dd, 2),
             "start_balance": round(self.start_balance, 2),
             "end_balance": round(self.broker.balance, 2),
+            "by_setup": by_setup,
         }

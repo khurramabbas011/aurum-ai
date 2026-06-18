@@ -66,6 +66,35 @@ def fmt(v) -> str:
         return "—"
 
 
+try:
+    from zoneinfo import ZoneInfo
+    _NY = ZoneInfo("America/New_York")
+except Exception:                       # pragma: no cover
+    _NY = None
+
+# ICT Silver Bullet windows in New York local time (DST handled by tz).
+_SB_WINDOWS_ET = [(3, 4, "London SB"), (10, 11, "AM SB"), (14, 15, "PM SB")]
+
+
+def silver_bullet_window(now: datetime = None):
+    """Return the active Silver Bullet window name, or None.
+
+    Converts the fixed ET windows to the user's GMT clock via the
+    America/New_York tz so it stays correct across daylight saving.
+    """
+    now = now or gmt_now()
+    if _NY is None:
+        return None
+    try:
+        et = now.astimezone(_NY)
+    except Exception:
+        return None
+    for start, end, name in _SB_WINDOWS_ET:
+        if start <= et.hour < end:
+            return name
+    return None
+
+
 def session_of(t: datetime) -> str:
     """Tag a GMT timestamp with its trading session (a learning feature)."""
     try:

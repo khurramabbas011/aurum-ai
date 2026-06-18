@@ -62,6 +62,14 @@ Profit factor  : {s['profit_factor']}
 Max drawdown   : ${s['max_drawdown_usd']}
 Balance        : ${s['start_balance']} → ${s['end_balance']}
 {LINE}"""
+    bs = s.get("by_setup") or {}
+    if bs:
+        out += "\nWIN RATE BY SETUP\n"
+        for name, d in sorted(bs.items(), key=lambda kv: kv[1]["n"],
+                              reverse=True):
+            out += (f"  {name:<14} n={d['n']:>3}  win={d['win_rate']:>5}%  "
+                    f"net={d['net_r']:+}R  avg={d['avg_r']:+}R\n")
+        out += LINE
     if playbook:
         out += "\n" + playbook.summary() + "\n" + LINE
     return out

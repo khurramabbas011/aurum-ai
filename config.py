@@ -22,13 +22,16 @@ MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 AGENT_NAME = "AURUM AI"
 SYMBOL = "XAUUSD"                      # auto-resolved (XAUUSDm etc.) at connect
 TIMEFRAMES = ["D1", "H4", "H1", "M30", "M15", "M5", "M1"]   # top-down order
-SIGNAL_TFS = ["M15", "M5"]            # timeframes the strategy hunts entries on
+SIGNAL_TFS = ["M15", "M5", "M1"]      # timeframes the strategy hunts entries on
 HTF_BIAS_TFS = ["D1", "H4", "H1"]    # timeframes that set directional bias
 
 # ───────────────────────── execution mode (SAFETY)
 ENABLE_LIVE_TRADING = False           # False = paper only (no MT5 orders)
 PAPER_START_BALANCE = 5000.0          # paper/backtest starting equity (USD)
 REQUIRE_DEMO_ACCOUNT = True           # block live orders on a real/live account
+
+# ───────────────────────── alerts
+DISCORD_WEBHOOK_URL = ""              # set in config_local.py (gitignored secret)
 
 # ───────────────────────── swing detection (per-TF lookback)
 SWING_LOOKBACK = {"M1": 5, "M5": 5, "M15": 7, "M30": 8,
@@ -42,21 +45,34 @@ SWEEP_MIN_WICK_PIPS = 3
 RANGE_TOLERANCE_PIPS = 25
 PIP_SIZE = 0.10                       # 1 pip = 0.10 price units for XAUUSD
 POINT_SIZE = 0.01
+SPREAD_COST_PIPS = 3                  # modeled round-turn cost in paper/backtest
+                                      #   (live uses the broker's real spread)
 
 # ───────────────────────── strategy
 MIN_RR = 2.0                          # minimum reward:risk to TP1
 SL_BUFFER_PIPS = 3                    # structural SL buffer beyond the wick
+VENOM_MIN_STRIKE_PIPS = 8             # min sweep wick to count as a venom strike
+BOS_RETEST_TOL_PIPS = 18              # how close to the broken level = a valid retest
 TP1_CLOSE_PCT = 40                    # % closed at TP1 (rest trails)
 REQUIRE_HTF_ALIGNMENT = True          # only take signals with HTF bias
 MIN_EDGE_SCORE = 0.35                 # learning gate: skip buckets below this
+# Scalp guard: reject setups whose structural stop is wider than this.
+# Keeps SL/TP scalp-sized and pushes entries to tighter (M5/M1) structure.
+# FIXED scalp targets — every setup gets the SAME SL/TP (overrides
+# structural sizing). 50p SL / 100p TP = a clean 1:2 on every trade.
+USE_FIXED_SL_TP = True
+FIXED_SL_PIPS = 50                    # stop loss on every trade (pips)
+FIXED_TP_PIPS = 100                   # take profit on every trade (pips)
+MAX_SL_PIPS = 60                      # (used only if USE_FIXED_SL_TP is False)
+MIN_SL_PIPS = 6
 
 # ───────────────────────── risk rails (NEVER widened by learning)
 RISK_PER_TRADE = 0.005                # 0.5% base risk
-ABSOLUTE_MAX_RISK = 0.01              # 1% hard cap
-MAX_DAILY_LOSS = 0.02                 # 2% daily drawdown -> kill switch
-MAX_OPEN_POSITIONS = 1
-MAX_TRADES_DAY = 6
-MAX_CONSEC_LOSSES = 3                 # pause after 3 losses in a row
+ABSOLUTE_MAX_RISK = 0.01              # 1% hard cap PER trade
+MAX_DAILY_LOSS = 0.04                 # 4% daily drawdown -> kill switch (realistic)
+MAX_OPEN_POSITIONS = 3               # a few concurrent setups, not overexposed
+MAX_TRADES_DAY = 12                   # active scalping without overtrading
+MAX_CONSEC_LOSSES = 3                 # pause after 3 losses in a row (discipline)
 
 # ───────────────────────── self-learning
 LEARNING_ENABLED = True
@@ -72,10 +88,14 @@ TRADE_MONITOR_SECONDS = 20
 # ───────────────────────── paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "logs", "aurum_ai.log")
-DB_PATH = os.path.join(BASE_DIR, "data_store", "aurum.db")
+# Live trades and backtest trades live in SEPARATE databases so the
+# live win-rate / stats are never polluted by backtest runs.
+DB_PATH = os.path.join(BASE_DIR, "data_store", "live.db")
+BACKTEST_DB_PATH = os.path.join(BASE_DIR, "data_store", "backtest.db")
 REPORT_FILE = os.path.join(BASE_DIR, "logs", "structure_report.txt")
 CHART_FILE = os.path.join(BASE_DIR, "logs", "chart.html")
 PLAYBOOK_FILE = os.path.join(BASE_DIR, "data_store", "playbook.json")
+SNAPSHOT_FILE = os.path.join(BASE_DIR, "data_store", "snapshot.json")
 
 # MQL5 chart bridge (optional live drawing on the MT5 chart)
 _MT5_COMMON = os.path.join(os.environ.get("APPDATA", BASE_DIR),
