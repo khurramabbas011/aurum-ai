@@ -28,7 +28,35 @@ class TradeManager:
             "features": dict(sig.features), "reason": sig.reason,
             "bias_feat": sig.features.get("htf_aligned"),
             "realised": 0.0, "tp1_done": False, "lots0": pos.lots,
+            "open_time": pos.open_time,
         }
+
+    def tracked_tickets(self) -> list:
+        return list(self._meta.keys())
+
+    def finalize_external(self, ticket, exit_price, pnl_usd) -> ClosedTrade | None:
+        """Build a ClosedTrade for a position that was closed OUTSIDE the
+        manager (e.g. MT5 hit SL/TP server-side). Returns it so the loop
+        can log + alert + feed the learning layer."""
+        meta = self._meta.get(ticket)
+        if not meta:
+            return None
+        risk_usd = abs(meta["entry"] - meta["sl0"]) * meta["lots0"] * 100.0
+        pnl_r = round(pnl_usd / risk_usd, 2) if risk_usd > 0 else 0.0
+        result = "WIN" if pnl_usd > 0 else "LOSS" if pnl_usd < 0 else "BREAKEVEN"
+        ct = ClosedTrade(
+            ticket=ticket, side=meta["side"], setup=meta["setup"],
+            timeframe=meta["timeframe"], entry=meta["entry"],
+            exit=round(exit_price, 2), sl=meta["sl0"], lots=meta["lots0"],
+            pnl_usd=round(pnl_usd, 2), pnl_r=pnl_r, result=result,
+            open_time=meta.get("open_time") or gmt_now(), close_time=gmt_now(),
+            bias="aligned" if meta.get("bias_feat") else "—",
+            session=session_of(gmt_now()), features=meta["features"],
+            reason=meta["reason"])
+        self._meta.pop(ticket, None)
+        log.info("#%d CLOSED(server) %s %.2f (%.2fR)", ticket, result,
+                 pnl_usd, pnl_r)
+        return ct
 
     def signatures(self) -> set:
         """(timeframe, side, setup) of every tracked open trade — used to

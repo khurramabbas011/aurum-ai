@@ -246,6 +246,27 @@ def cmd_live(_args):
                             pb.fit(mem.closed_trades())
                             think("↻ self-learning: playbook refit")
 
+            # detect positions MT5 closed SERVER-SIDE (SL/TP hit at tick level
+            # before our 15s check). These vanish from open_positions, so we
+            # finalize them from history -> log, alert, learn.
+            open_now = {p.ticket for p in broker.open_positions()}
+            for tk in manager.tracked_tickets():
+                if tk in open_now:
+                    continue
+                info = broker.closed_info(tk)
+                exitp = info["exit"] if info else price.get("bid") or 0.0
+                pnl = info["profit"] if info else 0.0
+                closed = manager.finalize_external(tk, exitp, pnl)
+                if closed:
+                    mem.log_trade(closed)
+                    risk.record_result(closed.result == "WIN")
+                    think(f"🏁 CLOSE #{closed.ticket} {closed.setup} "
+                          f"{closed.result} {closed.pnl_r:+}R")
+                    discord.trade_close(closed)
+                    if len(mem.closed_trades()) % config.LEARN_AFTER_TRADES == 0:
+                        pb.fit(mem.closed_trades())
+                        think("↻ self-learning: playbook refit")
+
             # hunt setups — allow several concurrent (different setup/tf/side);
             # never stack duplicates of the same setup signature
             active_sigs = manager.signatures()

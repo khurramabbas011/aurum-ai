@@ -71,6 +71,9 @@ class PaperBroker:
     def open_positions(self) -> list[Position]:
         return list(self.positions.values())
 
+    def closed_info(self, ticket):
+        return None      # paper closes are manager-driven; nothing external
+
     def account(self) -> dict:
         return {"balance": round(self.balance, 2),
                 "equity": round(self.equity, 2), "demo": True}
@@ -156,6 +159,21 @@ class MT5Broker:
                 p.price_open, p.volume, p.sl, p.tp, gmt_now(), p.comment,
                 profit=p.profit))
         return out
+
+    def closed_info(self, ticket):
+        """Realized result for a position MT5 already closed (SL/TP),
+        summed from its history deals. None if not found yet."""
+        import datetime as dt
+        deals = mt5.history_deals_get(
+            dt.datetime.now() - dt.timedelta(days=3),
+            dt.datetime.now() + dt.timedelta(minutes=1))
+        if not deals:
+            return None
+        dz = [d for d in deals if getattr(d, "position_id", None) == ticket]
+        if not dz:
+            return None
+        profit = sum(d.profit + d.swap + d.commission for d in dz)
+        return {"exit": dz[-1].price, "profit": round(profit, 2)}
 
     def account(self) -> dict:
         return self.feed.account_info()

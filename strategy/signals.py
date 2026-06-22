@@ -126,6 +126,17 @@ class SignalEngine:
                  sig.sl, sig.tp1, sig.rr, sig.edge_score)
         return sig
 
+    @staticmethod
+    def _aligned(side, bias) -> bool:
+        """True if a trade side agrees with the HTF bias (always true when
+        bias is sideways). Lets reversal setups skip counter-trend signals
+        early instead of generating-then-rejecting them."""
+        if bias.direction == State.BULLISH:
+            return side == Side.BUY
+        if bias.direction == State.BEARISH:
+            return side == Side.SELL
+        return True
+
     # ---------- ICT Unicorn: breaker + FVG overlap on MSS ----------
     def _unicorn(self, tf, m, bias) -> Signal | None:
         z = m.unicorn
@@ -153,35 +164,33 @@ class SignalEngine:
     def _venom(self, tf, m, bias) -> Signal | None:
         sw = m.sweep
         if not sw.detected or sw.wick_pips < config.VENOM_MIN_STRIKE_PIPS:
-            return None                       # need an AGGRESSIVE strike
-        ev = m.event
-        if sw.side == "SELL_SIDE":            # struck sell-side liq -> long
-            want, side = State.BULLISH, Side.BUY
-        elif sw.side == "BUY_SIDE":           # struck buy-side liq -> short
-            want, side = State.BEARISH, Side.SELL
+            return None                       # need an AGGRESSIVE strike (>=8p)
+        # the strike (big wick beyond a swing + close back) IS the reversal:
+        # sell-side liquidity struck -> long, buy-side struck -> short.
+        if sw.side == "SELL_SIDE":
+            side = Side.BUY
+        elif sw.side == "BUY_SIDE":
+            side = Side.SELL
         else:
             return None
-        # require a market-structure shift in the reversal direction
-        if ev.type == EventType.NONE or ev.direction != want:
+        # only the bias-aligned direction — don't generate counter-trend
+        # strikes that the alignment gate would just reject
+        if not self._aligned(side, bias):
             return None
         price = m.current_price
-        tol = config.PIP_SIZE * 6
-        cand = [g for g in m.fvgs if g.direction == want and not g.filled
-                and g.bottom - tol <= price <= g.top + tol]
-        if not cand:
-            return None
-        g = cand[-1]
         buf = to_price(config.SL_BUFFER_PIPS)
         strike = sw.wick_pips * config.PIP_SIZE
-        if want == State.BULLISH:
-            sl = round(min(sw.level - strike, g.bottom) - buf, 2)
+        if side == Side.BUY:
+            sl = round(sw.level - strike - buf, 2)
             tp1, tp2 = self._targets_up(m, price, sl)
         else:
-            sl = round(max(sw.level + strike, g.top) + buf, 2)
+            sl = round(sw.level + strike + buf, 2)
             tp1, tp2 = self._targets_dn(m, price, sl)
+        # bonus context: note if a displacement FVG sits at the entry
+        fvg = " + FVG" if any(g.bottom - 1 <= price <= g.top + 1
+                              for g in m.fvgs if not g.filled) else ""
         return self._mk(side, SetupType.VENOM, tf, price, sl, tp1, tp2,
-                        f"Venom: {sw.wick_pips}p strike of {sw.side} + "
-                        f"{want.value} MSS + FVG entry")
+                        f"Venom: {sw.wick_pips}p strike of {sw.side}{fvg}")
 
     # ---------- ICT Silver Bullet: time-window FVG entry ----------
     def _silver_bullet(self, tf, m, bias, now) -> Signal | None:
@@ -213,20 +222,23 @@ class SignalEngine:
                         f"Silver Bullet ({window}): FVG {g.bottom}-{g.top} "
                         f"toward liquidity")
 
-    # ---------- Setup A: sweep + CHoCH reversal ----------
+    # ---------- Setup A: liquidity sweep reversal ----------
     def _sweep_choch(self, tf, m, bias) -> Signal | None:
+        # A sweep = wick beyond a swing + body closed back = the rejection
+        # (the micro-CHoCH). Fade it. Venom already took the big strikes,
+        # so this handles normal-sized sweeps.
         sw = m.sweep
-        ev = m.event
-        if not sw.detected or ev.type != EventType.CHOCH:
+        if not sw.detected:
             return None
-        # sweep side must agree with the CHoCH reversal direction
-        if sw.side == "SELL_SIDE" and ev.direction == State.BULLISH:
+        if sw.side == "SELL_SIDE":            # sell-side liquidity grabbed -> long
             side = Side.BUY
-        elif sw.side == "BUY_SIDE" and ev.direction == State.BEARISH:
+        elif sw.side == "BUY_SIDE":           # buy-side liquidity grabbed -> short
             side = Side.SELL
         else:
             return None
-
+        # only the bias-aligned direction (no counter-trend sweep trades)
+        if not self._aligned(side, bias):
+            return None
         price = m.current_price
         buf = to_price(config.SL_BUFFER_PIPS)
         if side == Side.BUY:
@@ -236,7 +248,7 @@ class SignalEngine:
             sl = round(sw.level + sw.wick_pips * config.PIP_SIZE + buf, 2)
             tp1, tp2 = self._targets_dn(m, price, sl)
         return self._mk(side, SetupType.SWEEP_CHOCH, tf, price, sl, tp1, tp2,
-                        f"Sweep {sw.side} @ {sw.level} + {ev.direction.value} CHoCH")
+                        f"Sweep {sw.side} @ {sw.level} reversal")
 
     # ---------- Setup B: BOS continuation (RETEST entry) ----------
     def _bos_continuation(self, tf, m, bias) -> Signal | None:
